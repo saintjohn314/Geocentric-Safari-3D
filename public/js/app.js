@@ -1,4 +1,4 @@
-import { World, detectGPU } from './world.js';
+import { FlatWorld } from './flatworld.js';
 import { Geo, distanceKm } from './geo.js';
 import { MapPainter } from './mapPainter.js';
 import { skyAt, sunAltitude } from './astro.js';
@@ -25,7 +25,7 @@ const store = {
 };
 
 const DEFAULTS = {
-  sound: true, voice: false, labels: false, dayNight: true, style: 'classic', sky: 'fast', quality: 'auto',
+  sound: true, voice: false, labels: false, dayNight: true, style: 'terrain', sky: 'live', quality: 'simple',
   card: 'nations', players: 1, mode: 'card', timer: 30, rounds: 10, initials: '',
 };
 const SKY_SPEED = { live: 1, fast: 720, turbo: 7200 };
@@ -57,6 +57,7 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&
 export class App {
   constructor() {
     this.settings = { ...DEFAULTS, ...store.get('gs3d.settings', {}) };
+    if (!['simple', 'low', 'high'].includes(this.settings.quality)) this.settings.quality = 'simple';
     this.sound = new Sound();
     this.sound.muted = !this.settings.sound;
     this.sound.voice = this.settings.voice;
@@ -78,18 +79,25 @@ export class App {
     this.bind();
     this.applySettingsToUI();
 
-    const gpu = detectGPU();
-    if (!gpu.webgl) {
-      this.fail('This browser can’t show 3D graphics (WebGL is unavailable). Try Chrome, Edge, Firefox or Safari with hardware acceleration on.');
-      return;
-    }
-    const quality = this.resolveQuality(gpu);
-    this.quality = quality;
+    // Simple mode (default) needs no WebGL at all; Full 3D loads three.js only when chosen.
+    const engine = this.resolveEngine();
+    this.quality = engine;
     try {
-      this.world = new World($('#viewport'), { quality });
+      if (engine === 'simple') {
+        this.world = new FlatWorld($('#viewport'));
+      } else {
+        $('#loader-text').textContent = 'Starting 3D…';
+        const { World, detectGPU } = await import('./world.js');
+        const gpu = detectGPU();
+        if (!gpu.webgl) throw new Error('WebGL unavailable');
+        this.quality = gpu.software && !this.forcedEngine ? 'lite' : engine;
+        this.world = new World($('#viewport'), { quality: this.quality });
+      }
     } catch (err) {
       console.error(err);
-      this.fail('This device could not start 3D graphics (WebGL). Try another browser or enable hardware acceleration.');
+      this.settings.quality = 'simple';
+      this.save();
+      this.fail('Full 3D couldn’t start on this device, so Simple mode has been switched back on. Reload the page to play.');
       return;
     }
     this.world.setView('intro');
@@ -103,7 +111,7 @@ export class App {
     let geo;
     try {
       [geo] = await Promise.all([
-        Geo.load('data/countries-50m.json'),
+        Geo.load(engine === 'simple' ? 'data/countries-110m.json' : 'data/countries-50m.json'),
         document.fonts?.load('600 32px "Fredoka Variable"').catch(() => null),
       ]);
     } catch (err) {
@@ -112,11 +120,17 @@ export class App {
       return;
     }
     this.geo = geo;
-    const maxTex = this.world.renderer.capabilities.maxTextureSize;
-    // 4096px map only when High is chosen explicitly; 2048px is plenty at normal zoom and 4x cheaper.
-    const size = quality === 'lite' ? 1024 : this.settings.quality === 'high' && quality === 'high' && maxTex >= 4096 ? 4096 : 2048;
-    this.painter = new MapPainter(geo, size, quality === 'lite' ? 512 : 1024);
-    $('#loader-text').textContent = 'Painting the map…';
+    if (engine === 'simple') {
+      this.painter = new MapPainter(geo, 0, 1024); // only the highlight overlay is drawn live
+      this.world.setDetailPainter((canvas, matrix, scale) => this.paintDetail(canvas, matrix, scale));
+      this.world.onOverlayChange = () => this.paintMarks();
+    } else {
+      const maxTex = this.world.renderer.capabilities.maxTextureSize;
+      // 4096px map only on High; 2048px is plenty at normal zoom and 4x cheaper.
+      const size = this.quality === 'lite' ? 1024 : this.quality === 'high' && maxTex >= 4096 ? 4096 : 2048;
+      this.painter = new MapPainter(geo, size, this.quality === 'lite' ? 512 : 1024);
+      $('#loader-text').textContent = 'Painting the map…';
+    }
     await this.repaintMap();
     this.world.setOverlayCanvas(this.painter.overlay);
     this.painter.paintOverlay([]);
@@ -129,7 +143,7 @@ export class App {
     this.idleDisplays();
     this.view = 'title';
     this.show('title');
-    if (quality === 'lite') {
+    if (this.quality === 'lite') {
       this.setStrip('Lite mode', 'This browser is drawing 3D without graphics acceleration, so detail is reduced to keep things smooth. Turn on hardware acceleration in your browser settings for the full experience.');
     }
   }
@@ -139,16 +153,14 @@ export class App {
     $('.loader__ring')?.remove();
   }
 
-  // Software rendering always gets Lite; "auto" only picks High on a roomy desktop.
-  resolveQuality(gpu) {
-    const forced = new URLSearchParams(location.search).get('gfx'); // ?gfx=high|low|lite for testing
-    if (['high', 'low', 'lite'].includes(forced)) return forced;
-    if (gpu.software) return 'lite';
-    const q = this.settings.quality;
-    if (q === 'high' || q === 'low') return q;
-    const coarse = window.matchMedia('(pointer: coarse)').matches;
-    const roomy = (navigator.hardwareConcurrency || 4) >= 8 && (navigator.deviceMemory || 8) >= 8;
-    return !coarse && roomy ? 'high' : 'low';
+  // 'simple' (default, no WebGL), or Full 3D 'low' / 'high'. ?gfx=simple|low|high|lite forces one for testing.
+  resolveEngine() {
+    const forced = new URLSearchParams(location.search).get('gfx');
+    if (['simple', 'high', 'low', 'lite'].includes(forced)) {
+      this.forcedEngine = true;
+      return forced;
+    }
+    return ['high', 'low'].includes(this.settings.quality) ? this.settings.quality : 'simple';
   }
 
   // ---------------- DOM ----------------
@@ -259,6 +271,8 @@ export class App {
     $('#btn-fullscreen').addEventListener('click', () => this.fullscreen());
     $('#view-3d').addEventListener('click', () => this.world?.flyTo(this.game ? 'play' : 'orbit', 0.9));
     $('#view-top').addEventListener('click', () => this.world?.flyTo('top', 0.9));
+    $('#view-zoom-in').addEventListener('click', () => this.world?.zoomBy(1.8));
+    $('#view-zoom-out').addEventListener('click', () => this.world?.zoomBy(1 / 1.8));
     for (const [id, dir] of [['#view-spin-l', -1], ['#view-spin-r', 1]]) {
       const b = $(id);
       const stop = () => { if (this.world) this.world.spinInput = 0; };
@@ -336,6 +350,8 @@ export class App {
     if (!this.world) return;
     if (k === 'a' || k === 'arrowleft') this.world.spinInput = -1.2;
     else if (k === 'd' || k === 'arrowright') this.world.spinInput = 1.2;
+    else if (k === '+' || k === '=') this.world.zoomBy(1.5);
+    else if (k === '-' || k === '_') this.world.zoomBy(1 / 1.5);
     else if (k === 't') this.world.flyTo('top', 0.9);
     else if (k === 'v') this.world.flyTo(this.game ? 'play' : 'orbit', 0.9);
     else if (k === 'l') this.toggleSetting('labels');
@@ -888,7 +904,7 @@ export class App {
   paintMarks() {
     const items = [...this.marks];
     if (this.hoverFeature && !this.hoverFeature.properties.isIce) items.push({ feature: this.hoverFeature, fill: 'rgba(255,240,140,0.5)', stroke: 'rgba(255,170,0,0.95)', width: 4 });
-    this.painter.paintOverlay(items);
+    this.painter.paintOverlay(items, this.world.overlayTarget);
     this.world.refreshOverlay();
   }
 
@@ -1004,8 +1020,29 @@ export class App {
 
   async repaintMap() {
     if (!this.painter) return;
+    if (this.world.setMapImage) {
+      this.world.setMapImage(`assets/map-${this.settings.style === 'terrain' ? 'terrain' : 'classic'}${this.settings.labels ? '-labels' : ''}.webp`);
+      this.world.refreshDetail();
+      return;
+    }
     const done = await this.painter.paintBase({ style: this.settings.style, labels: this.settings.labels });
     if (done) this.world.setMapCanvas(this.painter.canvas);
+  }
+
+  // Simple mode: sharp close-ups need the detailed (1:50m) map data, fetched the first time you zoom in.
+  // Once loaded it also becomes the data used to identify countries, so small islands are found too.
+  async paintDetail(canvas, matrix, scale) {
+    if (!this.detailGeo) {
+      this.detailGeo = Geo.load('data/countries-50m.json').then((g) => {
+        this.geo = g;
+        this.painter.geo = g;
+        this.painter.overlayPaths.clear();
+        this.detailMap = new MapPainter(g, 2048, 1);
+        return g;
+      });
+    }
+    await this.detailGeo;
+    return this.detailMap.paintDetail(canvas, matrix, scale, { style: this.settings.style, labels: this.settings.labels });
   }
 
   fullscreen() {

@@ -16,55 +16,111 @@ const CIRCLES = [
 export class MapPainter {
   constructor(geo, size, overlaySize = 1024) {
     this.geo = geo;
-    this.size = size;
-    this.canvas = document.createElement('canvas');
-    this.canvas.width = this.canvas.height = size;
+    this.size = size; // coordinate space of the cached shapes (and of the full-disc picture in 3D mode)
     this.overlay = document.createElement('canvas');
     this.overlay.width = this.overlay.height = overlaySize;
     this.overlayPaths = new Map();
     this.token = 0;
+    this.detailToken = 0;
   }
 
-  // Project every shape once into reusable Path2D objects; repaints (labels, map style) then only fill pixels.
+  // Project every shape once into reusable Path2D objects; repaints (labels, map style, zoomed-in
+  // detail) then only fill pixels.
   async buildPaths(pause) {
     if (this.paths) return;
-    const proj = makeProjection(this.size);
-    const toPath = (obj) => {
-      const p = new Path2D();
-      d3.geoPath(proj, p)(obj);
-      return p;
-    };
-    const area = d3.geoPath(proj);
-    const paths = { proj, land: toPath(this.geo.land) };
-    await pause();
-    paths.borders = toPath(this.geo.borders);
-    paths.graticule = toPath(d3.geoGraticule().step([15, 15]).extentMajor([[-180, -89.999], [180, 89.999]])());
-    await pause();
-    paths.features = [];
-    for (const [i, f] of this.geo.features.entries()) {
-      paths.features.push({ f, path: toPath(f), area: area.area(f) });
-      if (i % 60 === 59) await pause();
-    }
-    this.paths = paths;
+    if (this.building) return this.building;
+    this.building = (async () => {
+      this.geo.colourise();
+      const proj = makeProjection(this.size);
+      const toPath = (obj) => {
+        const p = new Path2D();
+        d3.geoPath(proj, p)(obj);
+        return p;
+      };
+      const area = d3.geoPath(proj);
+      const paths = { proj, land: toPath(this.geo.land) };
+      await pause();
+      paths.borders = toPath(this.geo.borders);
+      paths.graticule = toPath(d3.geoGraticule().step([15, 15]).extentMajor([[-180, -89.999], [180, 89.999]])());
+      await pause();
+      paths.features = [];
+      for (const [i, f] of this.geo.features.entries()) {
+        paths.features.push({ f, path: toPath(f), area: area.area(f) });
+        if (i % 60 === 59) await pause();
+      }
+      this.paths = paths;
+    })();
+    return this.building;
   }
 
-  // Paints in small steps, yielding to the browser between them so the page never locks up.
-  // Returns false if a newer paint request superseded this one.
+  // The whole disc as one picture (3D mode). Paints in small steps, yielding to the browser between
+  // them so the page never locks up. Returns false if a newer paint request superseded this one.
   async paintBase({ style = 'classic', labels = false } = {}, pause = nextFrame) {
     const token = ++this.token;
     await this.buildPaths(pause);
     if (token !== this.token) return false;
-    const { proj, land, borders, graticule, features } = this.paths;
     const S = this.size;
     const k = S / 4096;
+    if (!this.canvas) {
+      this.canvas = document.createElement('canvas');
+      this.canvas.width = this.canvas.height = S;
+    }
     const ctx = this.canvas.getContext('2d');
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, S, S);
+    return this.render(ctx, {
+      style,
+      labels,
+      lw: (w) => w * k,
+      labelSize: (a) => (a < 700 * k * k ? 0 : Math.max(18 * k, Math.min(140 * k, Math.sqrt(a) * 0.15))),
+      grainScale: 1,
+    }, async () => {
+      if (token !== this.token) return false;
+      await pause();
+      return token === this.token;
+    });
+  }
+
+  // A sharp close-up drawn straight onto a screen-sized canvas. `matrix` maps shape units to canvas
+  // pixels and `scale` is its zoom (canvas pixels per shape unit), so lines and lettering keep a
+  // constant on-screen size however far you zoom in.
+  async paintDetail(canvas, matrix, scale, { style = 'classic', labels = false } = {}) {
+    const token = ++this.detailToken;
+    await this.buildPaths(nextFrame);
+    if (token !== this.detailToken) return false;
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.setTransform(matrix);
+    const ok = await this.render(ctx, {
+      style,
+      labels,
+      lw: (w) => (w * 0.55) / scale,
+      labelSize: (a) => {
+        const side = Math.sqrt(a) * scale;
+        return side < 30 ? 0 : Math.max(11, Math.min(30, side * 0.12)) / scale;
+      },
+      grainScale: 1 / scale,
+    }, async () => {
+      if (token !== this.detailToken) return false;
+      await nextFrame();
+      return token === this.detailToken;
+    });
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    return ok;
+  }
+
+  async render(ctx, cfg, step) {
+    const { proj, land, borders, graticule, features } = this.paths;
+    const { lw } = cfg;
+    const S = this.size;
     const c = S / 2;
-    const classic = style !== 'terrain';
+    const classic = cfg.style !== 'terrain';
     const rAt = (lat) => ((90 - lat) / 180) * c;
     const grain = ctx.createPattern(noiseTile(), 'repeat');
+    grain.setTransform?.(new DOMMatrix().scale(cfg.grainScale));
 
     ctx.save();
-    ctx.clearRect(0, 0, S, S);
     ctx.beginPath();
     ctx.arc(c, c, c, 0, Math.PI * 2);
     ctx.clip();
@@ -85,15 +141,15 @@ export class MapPainter {
     // Shallow-water glow along every coast: a few soft strokes instead of a costly blur filter
     ctx.lineJoin = 'round';
     for (const [w, a] of [[30, 0.12], [18, 0.2], [9, 0.3]]) {
-      ctx.lineWidth = w * k;
+      ctx.lineWidth = lw(w);
       ctx.strokeStyle = classic ? `rgba(200,240,255,${a})` : `rgba(120,210,255,${a * 0.85})`;
       ctx.stroke(land);
     }
 
-    ctx.lineWidth = 1.4 * k;
+    ctx.lineWidth = lw(1.4);
     ctx.strokeStyle = 'rgba(255,255,255,0.18)';
     ctx.stroke(graticule);
-    if (!(await this.step(token, pause))) return false;
+    if (!(await step())) { ctx.restore(); return false; }
 
     // Land
     if (classic) {
@@ -119,13 +175,13 @@ export class MapPainter {
     ctx.fillStyle = grain;
     ctx.fillRect(0, 0, S, S);
     ctx.restore();
-    if (!(await this.step(token, pause))) return false;
+    if (!(await step())) { ctx.restore(); return false; }
 
     // Borders + coastlines
-    ctx.lineWidth = (classic ? 1.6 : 1.2) * k;
+    ctx.lineWidth = lw(classic ? 1.6 : 1.2);
     ctx.strokeStyle = classic ? 'rgba(60,40,40,0.55)' : 'rgba(40,30,15,0.45)';
     ctx.stroke(borders);
-    ctx.lineWidth = 2 * k;
+    ctx.lineWidth = lw(2);
     ctx.strokeStyle = classic ? 'rgba(20,50,90,0.75)' : 'rgba(10,40,70,0.6)';
     ctx.stroke(land);
 
@@ -146,21 +202,21 @@ export class MapPainter {
       ctx.save();
       ctx.beginPath();
       ctx.arc(c, c, r, 0, Math.PI * 2);
-      ctx.setLineDash(circle.dash.map((v) => v * k));
+      ctx.setLineDash(circle.dash.map((v) => lw(v)));
       ctx.globalAlpha = 0.35;
-      ctx.lineWidth = circle.width * 3 * k;
+      ctx.lineWidth = lw(circle.width * 3);
       ctx.strokeStyle = circle.colour;
       ctx.stroke();
       ctx.globalAlpha = 1;
-      ctx.lineWidth = circle.width * k;
+      ctx.lineWidth = lw(circle.width);
       ctx.stroke();
       ctx.restore();
-      arcText(ctx, circle.label, c, r + 16 * k, circle.at, 26 * k, circle.colour);
+      arcText(ctx, circle.label, c, r + lw(16), circle.at, lw(26), circle.colour);
     }
 
     // Longitude ring on the ice
     ctx.save();
-    ctx.font = `600 ${30 * k}px "Fredoka Variable", "Fredoka", sans-serif`;
+    ctx.font = `600 ${lw(30)}px "Fredoka Variable", "Fredoka", sans-serif`;
     ctx.fillStyle = '#25507e';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
@@ -175,33 +231,23 @@ export class MapPainter {
     ctx.restore();
 
     // Compass star on the North Pole
-    compass(ctx, c, c, 46 * k);
+    compass(ctx, c, c, lw(46));
 
-    if (labels) this.paintLabels(ctx, proj, k);
+    if (cfg.labels) this.paintLabels(ctx, proj, cfg.labelSize);
     ctx.restore();
-    return token === this.token;
+    return step();
   }
 
-  async step(token, pause) {
-    if (token !== this.token) {
-      this.canvas.getContext('2d').restore();
-      return false;
-    }
-    await pause();
-    if (token === this.token) return true;
-    this.canvas.getContext('2d').restore();
-    return false;
-  }
-
-  paintLabels(ctx, proj, k) {
+  paintLabels(ctx, proj, labelSize) {
     ctx.save();
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.lineJoin = 'round';
     for (const { f, area } of this.paths.features) {
-      if (f.properties.isIce || area < 700 * k * k) continue;
-      const size = Math.max(18 * k, Math.min(140 * k, Math.sqrt(area) * 0.15));
-      const [x, y] = proj(f.properties.labelPoint);
+      if (f.properties.isIce) continue;
+      const size = labelSize(area);
+      if (!size) continue;
+      const [x, y] = proj(this.geo.labelPoint(f));
       ctx.font = `600 ${size}px "Fredoka Variable", "Fredoka", sans-serif`;
       ctx.lineWidth = size * 0.28;
       ctx.strokeStyle = 'rgba(255,255,255,0.85)';
@@ -212,24 +258,35 @@ export class MapPainter {
     ctx.restore();
   }
 
-  // items: [{ feature, fill, stroke }] or [{ circle: {center:[lon,lat], radius:deg}, fill, stroke }]
-  paintOverlay(items) {
-    const S = this.overlay.width;
-    const k = S / 4096;
-    const ctx = this.overlay.getContext('2d');
-    ctx.clearRect(0, 0, S, S);
+  // Highlights. items: [{ feature, fill, stroke }] or [{ circle: {center:[lon,lat], radius:deg}, fill, stroke }].
+  // Drawn onto the painter's own full-disc overlay, or onto `target` ({ canvas, matrix, scale } in
+  // shape space, like paintDetail) for a sharp close-up.
+  paintOverlay(items, target = null) {
+    const cv = target ? target.canvas : this.overlay;
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    let m;
+    if (target) {
+      ctx.setTransform(target.matrix); // target space is the same 2048-unit shape space as OVERLAY_SPACE
+      m = target.scale;
+    } else {
+      m = cv.width / OVERLAY_SPACE;
+      ctx.setTransform(m, 0, 0, m, 0, 0);
+    }
     for (const it of items) {
       const path = it.feature ? this.overlayPath(it.feature) : this.circlePath(it.circle);
       if (it.fill) { ctx.fillStyle = it.fill; ctx.fill(path); }
-      if (it.stroke) { ctx.lineWidth = (it.width || 6) * k * 2; ctx.strokeStyle = it.stroke; ctx.stroke(path); }
+      if (it.stroke) { ctx.lineWidth = ((it.width || 6) * 0.5) / m; ctx.strokeStyle = it.stroke; ctx.stroke(path); }
     }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
   }
 
   overlayPath(feature) {
     let p = this.overlayPaths.get(feature);
     if (!p) {
       p = new Path2D();
-      d3.geoPath(makeProjection(this.overlay.width), p)(feature);
+      d3.geoPath(makeProjection(OVERLAY_SPACE), p)(feature);
       this.overlayPaths.set(feature, p);
     }
     return p;
@@ -237,11 +294,12 @@ export class MapPainter {
 
   circlePath(circle) {
     const p = new Path2D();
-    d3.geoPath(makeProjection(this.overlay.width), p)(d3.geoCircle().center(circle.center).radius(circle.radius).precision(2)());
+    d3.geoPath(makeProjection(OVERLAY_SPACE), p)(d3.geoCircle().center(circle.center).radius(circle.radius).precision(2)());
     return p;
   }
 }
 
+const OVERLAY_SPACE = 2048; // highlight shapes are projected once into this coordinate space
 const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
 
 let tile = null;

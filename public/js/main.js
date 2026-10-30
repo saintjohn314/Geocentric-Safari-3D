@@ -4,16 +4,11 @@ const app = new App();
 window.geocentricSafari = app; // handy for debugging from the console
 app.start();
 
-if ('serviceWorker' in navigator && location.protocol === 'https:') {
-  // When a new release's service worker takes over a page that an older one served, reload once
-  // so the visitor isn't left running the previous version's cached code.
-  const hadController = !!navigator.serviceWorker.controller;
-  let reloaded = false;
-  navigator.serviceWorker.addEventListener('controllerchange', () => {
-    if (hadController && !reloaded) {
-      reloaded = true;
-      location.reload();
-    }
-  });
-  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+// The site no longer uses an offline service worker. Remove any left over from an earlier release
+// (and its cache) so every visit gets the current code straight from the server.
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.getRegistrations().then((regs) => regs.forEach((r) => r.unregister())).catch(() => {});
+}
+if ('caches' in window) {
+  caches.keys().then((keys) => keys.filter((k) => k.startsWith('gs3d-')).forEach((k) => caches.delete(k))).catch(() => {});
 }

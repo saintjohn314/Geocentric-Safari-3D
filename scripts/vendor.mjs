@@ -58,6 +58,7 @@ copy(join(nm, 'topojson-client/dist/topojson-client.min.js'), join(out, `topojso
 const dataDir = join(root, 'public', 'data');
 mkdirSync(dataDir, { recursive: true });
 copy(join(nm, 'world-atlas/countries-50m.json'), join(dataDir, 'countries-50m.json'));
+copy(join(nm, 'world-atlas/countries-110m.json'), join(dataDir, 'countries-110m.json'));
 
 // ---- fonts (latin subsets only) ----
 const fonts = join(out, 'fonts');

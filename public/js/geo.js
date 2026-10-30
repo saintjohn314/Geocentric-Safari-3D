@@ -77,25 +77,44 @@ export class Geo {
     return new Geo(await res.json());
   }
 
+  // Only cheap work happens up front (names + bounding boxes for hit-testing). The merged
+  // coastline, borders and map colours are computed on first use, which only the 3D painter needs.
   constructor(topology) {
+    this.topology = topology;
     const obj = topology.objects.countries;
     this.features = topojson.feature(topology, obj).features;
-    this.land = topojson.merge(topology, obj.geometries);
-    this.borders = topojson.mesh(topology, obj, (a, b) => a !== b);
     this.byName = new Map();
-
-    const neighbors = topojson.neighbors(obj.geometries);
     this.features.forEach((f, i) => {
       f.properties.name = cleanName(f.properties.name);
       f.properties.index = i;
       f.properties.isIce = f.properties.name.startsWith('Antarctica');
-      f.properties.area = d3.geoArea(f);
       f.properties.bounds = d3.geoBounds(f);
-      f.properties.labelPoint = largestPolygonCentroid(f);
       this.byName.set(f.properties.name, f);
     });
+  }
 
-    // Greedy map colouring so neighbouring countries never share a colour (classic school-map look).
+  get land() {
+    return this._land || (this._land = topojson.merge(this.topology, this.topology.objects.countries.geometries));
+  }
+
+  get borders() {
+    const obj = this.topology.objects.countries;
+    return this._borders || (this._borders = topojson.mesh(this.topology, obj, (a, b) => a !== b));
+  }
+
+  area(f) {
+    return f.properties.area ?? (f.properties.area = d3.geoArea(f));
+  }
+
+  labelPoint(f) {
+    return f.properties.labelPoint || (f.properties.labelPoint = largestPolygonCentroid(f));
+  }
+
+  // Greedy map colouring so neighbouring countries never share a colour (classic school-map look).
+  colourise() {
+    if (this.coloured) return;
+    this.coloured = true;
+    const neighbors = topojson.neighbors(this.topology.objects.countries.geometries);
     const order = this.features.map((_, i) => i).sort((a, b) => neighbors[b].length - neighbors[a].length);
     const colours = new Array(this.features.length).fill(-1);
     const N = 6;
@@ -124,7 +143,7 @@ export class Geo {
       const inLon = w <= e ? lon >= w - 0.01 && lon <= e + 0.01 : lon >= w - 0.01 || lon <= e + 0.01;
       if (!inLon) continue;
       // Prefer the smallest containing feature (enclaves such as Lesotho, Vatican City).
-      if (d3.geoContains(f, lonlat) && (!best || f.properties.area < best.properties.area)) best = f;
+      if (d3.geoContains(f, lonlat) && (!best || this.area(f) < this.area(best))) best = f;
     }
     return best;
   }

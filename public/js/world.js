@@ -119,7 +119,7 @@ export class World {
     controls.rotateSpeed = 0.55;
     controls.zoomSpeed = 0.9;
     controls.panSpeed = 0.8;
-    controls.minDistance = 3.2;
+    controls.minDistance = 1.2;
     controls.maxDistance = 90;
     controls.maxPolarAngle = 1.42;
     controls.screenSpacePanning = false;
@@ -681,6 +681,16 @@ export class World {
         resolve,
       };
     });
+  }
+
+  zoomBy(factor) {
+    const t = this.controls.target;
+    const d = this.camera.position.clone().sub(t);
+    const len = THREE.MathUtils.clamp(d.length() / factor, this.controls.minDistance, this.controls.maxDistance);
+    this.camera.position.copy(t).add(d.setLength(len));
+    this.controls.update();
+    this.lastInput = performance.now();
+    this.dirty = true;
   }
 
   // Zoom toward a place on the disc (keeps the current viewing angle).

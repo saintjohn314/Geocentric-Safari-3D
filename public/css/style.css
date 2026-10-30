@@ -305,6 +305,7 @@ kbd {
   to { box-shadow: 0 0 0 2.5px #fff, 0 0 0 14px rgba(255, 207, 51, 0), 0 0 30px rgba(255, 207, 51, 1); scale: 1.25; }
 }
 @media (pointer: coarse) { .spot { width: 34px; height: 34px; font-size: 16px; } #btn-fullscreen { display: none; } }
+@media (max-width: 560px) { .hud--tools { flex-direction: column; top: 8px; bottom: auto; } .hud--sky { max-width: calc(100% - 16px); } }
 @media (max-width: 560px) { .spot { width: 26px; height: 26px; font-size: 13px; } }
 
 .tooltip {
@@ -398,7 +399,8 @@ kbd {
   background: radial-gradient(circle at 50% 40%, #0c1830, #02040a 70%);
   transition: opacity 0.6s;
 }
-.loader.is-done { opacity: 0; pointer-events: none; }
+.loader.is-done { opacity: 0; pointer-events: none; visibility: hidden; transition: opacity 0.6s, visibility 0s 0.6s; }
+.loader.is-done .loader__ring { animation: none; }
 .loader p { margin: 0; font-family: var(--f-lcd); font-size: 24px; color: var(--green); letter-spacing: 1px; }
 .loader__ring {
   width: 54px;
@@ -409,6 +411,70 @@ kbd {
   animation: spin 0.9s linear infinite;
 }
 @keyframes spin { to { rotate: 360deg; } }
+
+/* ---------------- Simple mode (no WebGL) ---------------- */
+.flat {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  touch-action: none;
+  cursor: grab;
+  background: radial-gradient(120% 90% at 50% 0%, #0d1f3d 0%, #050a16 55%, #02040a 100%);
+}
+.flat:active { cursor: grabbing; }
+.stage.is-hunting .flat { cursor: crosshair; }
+.flat-space, .flat-svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.flat-board { position: absolute; left: 0; top: 0; transform-origin: 0 0; border-radius: 50%; pointer-events: none; }
+.flat-layer { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: 50%; display: block; }
+.flat-night { image-rendering: auto; }
+.flat-close { position: absolute; left: 0; top: 0; width: 100%; height: 100%; transform-origin: 0 0; pointer-events: none; }
+.flat-bodies { position: absolute; inset: 0; pointer-events: none; }
+.flat-sun, .flat-moon { position: absolute; left: 0; top: 0; border-radius: 50%; }
+.flat-sun {
+  background: radial-gradient(circle at 45% 40%, #fffbe6, #ffd23f 45%, #ff9a1f 75%);
+  box-shadow: 0 0 18px 6px rgba(255, 190, 60, 0.55), 0 0 60px 18px rgba(255, 150, 40, 0.25);
+}
+.flat-moon {
+  background: radial-gradient(circle at 40% 35%, #f4f6fa, #c9d0db 70%);
+  box-shadow: inset var(--shade, 0px) 0 0 0 rgba(12, 18, 36, 0.88), 0 0 12px 2px rgba(200, 220, 255, 0.35);
+}
+.flat-pin { position: absolute; left: 0; top: 0; width: 0; height: 0; }
+.flat-pin::before {
+  content: '';
+  position: absolute;
+  left: -1.5px;
+  top: -26px;
+  width: 3px;
+  height: 26px;
+  background: linear-gradient(#f2f5f8, #9aa6b4);
+  border-radius: 2px;
+}
+.flat-pin::after {
+  content: '';
+  position: absolute;
+  left: -8px;
+  top: -38px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #fff, var(--c) 55%);
+  box-shadow: 0 0 10px var(--c), 0 2px 4px rgba(0, 0, 0, 0.6);
+  animation: pin-drop 0.35s cubic-bezier(0.2, 1.6, 0.4, 1) both;
+}
+@keyframes pin-drop { from { transform: translateY(-18px); opacity: 0; } }
+.flat-pulse { position: absolute; left: 0; top: 0; width: 0; height: 0; }
+.flat-pulse::before {
+  content: '';
+  position: absolute;
+  left: -14px;
+  top: -14px;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 4px solid var(--c);
+  animation: pulse-ring 1.4s ease-out 3;
+}
+@keyframes pulse-ring { from { transform: scale(0.4); opacity: 1; } to { transform: scale(3.2); opacity: 0; } }
 
 /* ---------------- Overlay screens ---------------- */
 .screen {
@@ -529,7 +595,7 @@ kbd {
 }
 .big-btn:active { transform: translateY(4px); box-shadow: 0 2px 0 #7a0f22; }
 .blink { animation: blink 1.2s ease-in-out infinite; }
-@keyframes blink { 50% { filter: brightness(1.35); box-shadow: 0 6px 0 #7a0f22, 0 0 50px rgba(255, 59, 92, 0.85), inset 0 2px 0 rgba(255, 255, 255, 0.35); } }
+@keyframes blink { 50% { opacity: 0.72; } }
 
 /* Card picker: laminated lesson cards */
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; margin-bottom: 16px; }
