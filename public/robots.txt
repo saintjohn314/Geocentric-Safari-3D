@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://geocentric-safari-3d.netlify.app/sitemap.xml
