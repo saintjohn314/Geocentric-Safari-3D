@@ -1,4 +1,4 @@
-import { World } from './world.js';
+import { World, detectGPU } from './world.js';
 import { Geo, distanceKm } from './geo.js';
 import { MapPainter } from './mapPainter.js';
 import { skyAt, sunAltitude } from './astro.js';
@@ -78,7 +78,13 @@ export class App {
     this.bind();
     this.applySettingsToUI();
 
-    const quality = this.resolveQuality();
+    const gpu = detectGPU();
+    if (!gpu.webgl) {
+      this.fail('This browser can’t show 3D graphics (WebGL is unavailable). Try Chrome, Edge, Firefox or Safari with hardware acceleration on.');
+      return;
+    }
+    const quality = this.resolveQuality(gpu);
+    this.quality = quality;
     try {
       this.world = new World($('#viewport'), { quality });
     } catch (err) {
@@ -107,8 +113,11 @@ export class App {
     }
     this.geo = geo;
     const maxTex = this.world.renderer.capabilities.maxTextureSize;
-    this.painter = new MapPainter(geo, quality === 'high' && maxTex >= 4096 ? 4096 : 2048);
-    this.repaintMap();
+    // 4096px map only when High is chosen explicitly; 2048px is plenty at normal zoom and 4x cheaper.
+    const size = quality === 'lite' ? 1024 : this.settings.quality === 'high' && quality === 'high' && maxTex >= 4096 ? 4096 : 2048;
+    this.painter = new MapPainter(geo, size, quality === 'lite' ? 512 : 1024);
+    $('#loader-text').textContent = 'Painting the map…';
+    await this.repaintMap();
     this.world.setOverlayCanvas(this.painter.overlay);
     this.painter.paintOverlay([]);
     this.world.refreshOverlay();
@@ -120,7 +129,9 @@ export class App {
     this.idleDisplays();
     this.view = 'title';
     this.show('title');
-    this.watchPerformance(quality);
+    if (quality === 'lite') {
+      this.setStrip('Lite mode', 'This browser is drawing 3D without graphics acceleration, so detail is reduced to keep things smooth. Turn on hardware acceleration in your browser settings for the full experience.');
+    }
   }
 
   fail(message) {
@@ -128,31 +139,16 @@ export class App {
     $('.loader__ring')?.remove();
   }
 
-  resolveQuality() {
+  // Software rendering always gets Lite; "auto" only picks High on a roomy desktop.
+  resolveQuality(gpu) {
+    const forced = new URLSearchParams(location.search).get('gfx'); // ?gfx=high|low|lite for testing
+    if (['high', 'low', 'lite'].includes(forced)) return forced;
+    if (gpu.software) return 'lite';
     const q = this.settings.quality;
     if (q === 'high' || q === 'low') return q;
     const coarse = window.matchMedia('(pointer: coarse)').matches;
-    const weak = (navigator.hardwareConcurrency || 8) <= 4 || (navigator.deviceMemory || 8) <= 4;
-    return coarse || weak ? 'low' : 'high';
-  }
-
-  // If "auto" picked high quality but the device struggles, switch to low for next time.
-  watchPerformance(quality) {
-    if (this.settings.quality !== 'auto' || quality !== 'high') return;
-    let frames = 0;
-    let slow = 0;
-    const stop = this.world.onFrame((dt) => {
-      frames++;
-      if (dt > 1 / 28) slow++;
-      if (frames === 240) {
-        stop();
-        if (slow > 150) {
-          this.settings.quality = 'low';
-          this.save();
-          this.toast('Battery saver on', 'info', 'Graphics set to Low for this device');
-        }
-      }
-    });
+    const roomy = (navigator.hardwareConcurrency || 4) >= 8 && (navigator.deviceMemory || 8) >= 8;
+    return !coarse && roomy ? 'high' : 'low';
   }
 
   // ---------------- DOM ----------------
@@ -919,7 +915,7 @@ export class App {
     }
     const hit = this.world.pick(p.x, p.y);
     const f = hit ? this.geo.countryAt(hit.lonlat) : null;
-    this.setHover(f);
+    if (this.quality !== 'lite') this.setHover(f);
     if (this.view === 'explore' && hit) this.showTooltip(p.x, p.y, f ? f.properties.name : 'Open water', `${fmtLat(hit.lonlat[1])} ${fmtLon(hit.lonlat[0])}`);
     else this.el.tooltip.hidden = true;
   }
@@ -1006,10 +1002,10 @@ export class App {
     if (!back && this.view === 'menu') this.show('menu');
   }
 
-  repaintMap() {
+  async repaintMap() {
     if (!this.painter) return;
-    this.painter.paintBase({ style: this.settings.style, labels: this.settings.labels });
-    this.world.setMapCanvas(this.painter.canvas);
+    const done = await this.painter.paintBase({ style: this.settings.style, labels: this.settings.labels });
+    if (done) this.world.setMapCanvas(this.painter.canvas);
   }
 
   fullscreen() {

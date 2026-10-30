@@ -16,7 +16,11 @@ Live: https://geocentric-safari-3d.netlify.app
 - **A living sky.** The sun, moon (with its real phase) and constellations hang over the places where they are overhead *right now*, computed from a low-precision ephemeris. Daylight sweeps across the disc; speed the sky clock up in Settings.
 - **The model.** North Pole at the centre, the prime meridian pointing down (the UN-emblem layout), the Antarctic ice rim as a wall of ice shards, a gold base ring with chasing lights, and the glass firmament dome over it all.
 - **Free Explore.** Hover or tap anywhere to identify countries with their coordinates, local solar time and sun altitude.
-- **Polish.** Synthesised console sounds, optional talking console (reads questions aloud), country-name labels, classic-card or terrain map styles, bloom lighting on capable devices, a battery-saver mode, keyboard shortcuts, high scores per card, and it installs as an offline-capable app (PWA).
+- **Polish.** Synthesised console sounds, optional talking console (reads questions aloud), country-name labels, classic-card or terrain map styles, keyboard shortcuts, high scores per card, and it installs as an offline-capable app (PWA).
+
+## Performance
+
+The scene only redraws when something changes: full frame rate while you drag, zoom or play, a gentle ambient rate when idle. Resolution scales down automatically if frames run late. Browsers drawing 3D without graphics acceleration (software rendering) are detected and get **Lite mode** (smaller textures, 30 fps cap, near-zero idle CPU). Settings → Graphics lets you choose Auto, High or Low; append `?gfx=high`, `?gfx=low` or `?gfx=lite` to the URL to force a mode for testing.
 
 ## Controls
 

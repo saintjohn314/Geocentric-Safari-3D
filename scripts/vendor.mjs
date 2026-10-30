@@ -29,10 +29,6 @@ copy(join(nm, 'three/LICENSE'), join(threeDir, 'LICENSE'));
 const addonsSrc = join(nm, 'three/examples/jsm');
 const entryAddons = [
   'controls/OrbitControls.js',
-  'postprocessing/EffectComposer.js',
-  'postprocessing/RenderPass.js',
-  'postprocessing/UnrealBloomPass.js',
-  'postprocessing/OutputPass.js',
   'environments/RoomEnvironment.js',
 ];
 const seen = new Set();

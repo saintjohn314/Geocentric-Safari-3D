@@ -67,7 +67,7 @@ export function makeProjection(size) {
     .scale(size / 2 / Math.PI)
     .translate([size / 2, size / 2])
     .clipAngle(180 - 1e-3)
-    .precision(0.2);
+    .precision(0); // Natural Earth 50m is already dense; skipping adaptive resampling is much faster
 }
 
 export class Geo {

@@ -2,10 +2,6 @@
 // with the sun, moon and stars hanging above their real sub-points.
 import * as THREE from '../vendor/three-0.185.1/three.module.min.js';
 import { OrbitControls } from '../vendor/three-0.185.1/addons/controls/OrbitControls.js';
-import { EffectComposer } from '../vendor/three-0.185.1/addons/postprocessing/EffectComposer.js';
-import { RenderPass } from '../vendor/three-0.185.1/addons/postprocessing/RenderPass.js';
-import { UnrealBloomPass } from '../vendor/three-0.185.1/addons/postprocessing/UnrealBloomPass.js';
-import { OutputPass } from '../vendor/three-0.185.1/addons/postprocessing/OutputPass.js';
 import { RoomEnvironment } from '../vendor/three-0.185.1/addons/environments/RoomEnvironment.js';
 import { DISC_R, lonLatToLocal, lonLatToUV, uvToLonLat } from './geo.js';
 import { STARS, LINES } from './astro.js';
@@ -44,6 +40,22 @@ function glowTexture(inner, outer, size = 256) {
   return t;
 }
 
+// Reads the WebGL renderer name so we can spot software rendering (no GPU acceleration),
+// where every pixel is drawn by the CPU and the full-detail scene would grind the machine.
+export function detectGPU() {
+  try {
+    const c = document.createElement('canvas');
+    const gl = c.getContext('webgl2') || c.getContext('webgl');
+    if (!gl) return { webgl: false, software: false, name: '' };
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    const name = String(ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
+    return { webgl: true, software: /swiftshader|llvmpipe|softpipe|software|basic render/i.test(name), name };
+  } catch {
+    return { webgl: false, software: false, name: '' };
+  }
+}
+
 // GPU textures are allocated at a fixed size, so a different-sized image needs a fresh upload.
 function swapImage(texture, image) {
   if (texture.image && (texture.image.width !== image.width || texture.image.height !== image.height)) texture.dispose();
@@ -52,6 +64,7 @@ function swapImage(texture, image) {
 }
 
 export class World {
+  // quality: 'high' (sharper, more detail), 'low' (battery saver) or 'lite' (software rendering).
   constructor(container, { quality = 'high' } = {}) {
     this.container = container;
     this.hooks = new Set();
@@ -60,9 +73,26 @@ export class World {
     this.autoSpin = 0;
     this.spinInput = 0;
     this.tween = null;
+    this.quality = quality;
     this.highQuality = quality === 'high';
+    this.lite = quality === 'lite';
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    // Frame pacing: the scene is only redrawn when something changes. Full rate while the player
+    // interacts or the camera moves, a gentle ambient rate when idle, and the render resolution
+    // drops automatically if the device can't keep up.
+    this.fpsCap = this.lite ? 30 : 60;
+    this.dirty = true;
+    this.lastChange = 0;
+    this.controlsActive = false;
+    this.dprMax = Math.min(window.devicePixelRatio || 1, this.highQuality ? 1.5 : this.lite ? 0.75 : 1);
+    this.dpr = this.dprMax;
+    this.lastInput = performance.now();
+    this.lastRender = 0;
+    this.perf = { sum: 0, n: 0, good: 0 };
+    const poke = () => { this.lastInput = performance.now(); };
+    for (const ev of ['pointerdown', 'pointermove', 'wheel', 'keydown', 'touchstart']) window.addEventListener(ev, poke, { passive: true });
+
+    const renderer = new THREE.WebGLRenderer({ antialias: !this.lite, powerPreference: 'high-performance' });
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.NeutralToneMapping;
     renderer.toneMappingExposure = 1.0;
@@ -76,9 +106,12 @@ export class World {
     this.camera = new THREE.PerspectiveCamera(38, 1, 0.1, 3000);
     this.camera.position.set(0, 60, 150);
 
-    const pmrem = new THREE.PMREMGenerator(renderer);
-    this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-    this.scene.environmentIntensity = 0.55;
+    if (!this.lite) {
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+      this.scene.environmentIntensity = 0.55;
+      pmrem.dispose();
+    }
 
     const controls = new OrbitControls(this.camera, renderer.domElement);
     controls.enableDamping = true;
@@ -91,7 +124,9 @@ export class World {
     controls.maxPolarAngle = 1.42;
     controls.screenSpacePanning = false;
     controls.zoomToCursor = true;
-    controls.addEventListener('change', () => this.clampTarget());
+    controls.addEventListener('change', () => { this.clampTarget(); this.lastChange = performance.now(); });
+    controls.addEventListener('start', () => { this.controlsActive = true; });
+    controls.addEventListener('end', () => { this.controlsActive = false; });
     this.controls = controls;
 
     this.world = new THREE.Group();
@@ -114,7 +149,6 @@ export class World {
     this.ndc = new THREE.Vector2();
     this.tmp = new THREE.Vector3();
 
-    this.setupComposer();
     this.resize();
     new ResizeObserver(() => this.resize()).observe(container);
 
@@ -125,36 +159,32 @@ export class World {
   // ---------- construction ----------
 
   buildSpace() {
-    const sky = new THREE.Mesh(
-      new THREE.SphereGeometry(900, 48, 24),
-      new THREE.ShaderMaterial({
-        side: THREE.BackSide,
-        depthWrite: false,
-        uniforms: { uHigh: { value: this.highQuality ? 1 : 0 } },
-        vertexShader: 'varying vec3 vP; void main(){ vP = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
-        fragmentShader: `
-          varying vec3 vP; uniform float uHigh;
-          float h(vec3 p){ return fract(sin(dot(p, vec3(12.9898,78.233,37.719))) * 43758.5453); }
-          float n(vec3 p){ vec3 i=floor(p); vec3 f=fract(p); f=f*f*(3.0-2.0*f);
-            return mix(mix(mix(h(i),h(i+vec3(1,0,0)),f.x),mix(h(i+vec3(0,1,0)),h(i+vec3(1,1,0)),f.x),f.y),
-                       mix(mix(h(i+vec3(0,0,1)),h(i+vec3(1,0,1)),f.x),mix(h(i+vec3(0,1,1)),h(i+vec3(1,1,1)),f.x),f.y),f.z); }
-          void main(){
-            float y = vP.y;
-            vec3 col = mix(vec3(0.010,0.016,0.035), vec3(0.030,0.060,0.130), smoothstep(-0.2,0.9,y));
-            if (uHigh > 0.5) {
-              float neb = n(vP*3.0)*0.55 + n(vP*7.0)*0.3 + n(vP*15.0)*0.15;
-              neb = smoothstep(0.55, 0.95, neb);
-              col += neb * mix(vec3(0.10,0.03,0.16), vec3(0.02,0.10,0.18), n(vP*2.0)) * 0.9;
-            }
-            gl_FragColor = vec4(col, 1.0);
-            #include <colorspace_fragment>
-          }`,
-      }),
-    );
+    // Nebula colours are baked into the sphere's vertices once, so the background costs nothing per frame.
+    const geo = new THREE.SphereGeometry(900, 64, 32);
+    const vp = geo.attributes.position;
+    const colors = new Float32Array(vp.count * 3);
+    const v = new THREE.Vector3();
+    const deep = new THREE.Color(0.010, 0.016, 0.035);
+    const high = new THREE.Color(0.030, 0.060, 0.130);
+    const violet = new THREE.Color(0.10, 0.03, 0.16);
+    const teal = new THREE.Color(0.02, 0.10, 0.18);
+    const nc = new THREE.Color();
+    const wave = (p, f) => Math.sin(p.x * f + 1.7) * Math.sin(p.y * f * 1.3 + 0.4) * Math.sin(p.z * f * 0.9 + 2.1);
+    for (let i = 0; i < vp.count; i++) {
+      v.fromBufferAttribute(vp, i).normalize();
+      nc.copy(deep).lerp(high, THREE.MathUtils.smoothstep(v.y, -0.2, 0.9));
+      if (!this.lite) {
+        const neb = THREE.MathUtils.smoothstep(0.5 + 0.5 * (wave(v, 3) * 0.6 + wave(v, 7) * 0.4), 0.55, 0.95);
+        nc.add(violet.clone().lerp(teal, 0.5 + 0.5 * wave(v, 2)).multiplyScalar(neb * 0.9));
+      }
+      colors.set([nc.r, nc.g, nc.b], i * 3);
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    const sky = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, depthWrite: false }));
     this.scene.add(sky);
 
     const rand = rng(7);
-    const n = this.highQuality ? 4000 : 1800;
+    const n = this.highQuality ? 3000 : this.lite ? 800 : 1600;
     const pos = new Float32Array(n * 3);
     const col = new Float32Array(n * 3);
     const tint = [new THREE.Color('#ffffff'), new THREE.Color('#a9c8ff'), new THREE.Color('#ffe2b0'), new THREE.Color('#ffd0d0')];
@@ -180,8 +210,11 @@ export class World {
     this.overlayTexture = new THREE.CanvasTexture(blank);
     for (const t of [this.mapTexture, this.overlayTexture]) {
       t.colorSpace = THREE.SRGBColorSpace;
-      t.anisotropy = this.renderer.capabilities.getMaxAnisotropy();
+      t.anisotropy = this.lite ? 1 : Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
     }
+    // The highlight overlay changes often; skipping mipmaps keeps each re-upload cheap.
+    this.overlayTexture.generateMipmaps = false;
+    this.overlayTexture.minFilter = THREE.LinearFilter;
 
     this.discUniforms = {
       uMap: { value: this.mapTexture },
@@ -192,7 +225,7 @@ export class World {
       uTime: { value: 0 },
     };
     const top = new THREE.Mesh(
-      new THREE.CircleGeometry(R, 256).rotateX(-Math.PI / 2),
+      new THREE.CircleGeometry(R, this.lite ? 128 : 256).rotateX(-Math.PI / 2),
       new THREE.ShaderMaterial({
         uniforms: this.discUniforms,
         toneMapped: false,
@@ -264,8 +297,8 @@ export class World {
   buildIceWall() {
     const rand = rng(11);
     const rows = [
-      { n: this.highQuality ? 520 : 300, r0: 0.995, r1: 1.012, h0: 0.25, h1: 0.95, w0: 0.11, w1: 0.24 },
-      { n: this.highQuality ? 360 : 200, r0: 0.975, r1: 0.993, h0: 0.12, h1: 0.45, w0: 0.08, w1: 0.16 },
+      { n: this.highQuality ? 480 : 300, r0: 0.995, r1: 1.012, h0: 0.25, h1: 0.95, w0: 0.11, w1: 0.24 },
+      { n: this.highQuality ? 320 : this.lite ? 0 : 180, r0: 0.975, r1: 0.993, h0: 0.12, h1: 0.45, w0: 0.08, w1: 0.16 },
     ];
     const total = rows.reduce((s, r) => s + r.n, 0);
     const geom = new THREE.ConeGeometry(1, 1, 5, 1).translate(0, 0.5, 0);
@@ -276,8 +309,6 @@ export class World {
       flatShading: true,
       emissive: '#2a5a88',
       emissiveIntensity: 0.25,
-      transparent: true,
-      opacity: 0.96,
     });
     const mesh = new THREE.InstancedMesh(geom, mat, total);
     const m = new THREE.Matrix4();
@@ -313,16 +344,28 @@ export class World {
     this.world.add(band);
 
     const n = 64;
-    const bulbs = new THREE.InstancedMesh(new THREE.SphereGeometry(0.075, 14, 10), new THREE.MeshBasicMaterial({ color: '#ffffff', toneMapped: false }), n);
+    const bulbs = new THREE.InstancedMesh(new THREE.SphereGeometry(0.075, 12, 8), new THREE.MeshBasicMaterial({ color: '#ffffff', toneMapped: false }), n);
     const m = new THREE.Matrix4();
+    const glowPos = new Float32Array(n * 3);
     for (let i = 0; i < n; i++) {
       const a = (i / n) * Math.PI * 2;
-      m.makeTranslation(Math.sin(a) * (R * 0.985 + 0.13), BASE_Y + 0.05, Math.cos(a) * (R * 0.985 + 0.13));
+      const x = Math.sin(a) * (R * 0.985 + 0.13);
+      const z = Math.cos(a) * (R * 0.985 + 0.13);
+      m.makeTranslation(x, BASE_Y + 0.05, z);
       bulbs.setMatrixAt(i, m);
-      bulbs.setColorAt(i, new THREE.Color(3, 2.2, 0.8));
+      bulbs.setColorAt(i, new THREE.Color('#ffe9a8'));
+      glowPos.set([x, BASE_Y + 0.05, z], i * 3);
     }
     this.bulbs = bulbs;
     this.world.add(bulbs);
+    const gg = new THREE.BufferGeometry();
+    gg.setAttribute('position', new THREE.BufferAttribute(glowPos, 3));
+    gg.setAttribute('color', new THREE.BufferAttribute(new Float32Array(n * 3).fill(1), 3));
+    this.bulbGlow = new THREE.Points(gg, new THREE.PointsMaterial({
+      size: 0.6, map: glowTexture('rgba(255,230,150,1)', 'rgba(255,170,40,0.35)', 64), vertexColors: true,
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    }));
+    this.world.add(this.bulbGlow);
 
     const metal = new THREE.MeshStandardMaterial({ color: '#3a4656', metalness: 0.9, roughness: 0.35 });
     for (const [rad, tube, y] of [[R * 1.3, 0.07, BASE_Y - 0.15], [R * 1.42, 0.035, BASE_Y - 0.2]]) {
@@ -350,7 +393,7 @@ export class World {
   }
 
   buildDome() {
-    const geom = new THREE.SphereGeometry(DOME_R, 128, 48, 0, Math.PI * 2, 0, Math.PI / 2);
+    const geom = new THREE.SphereGeometry(DOME_R, 96, 32, 0, Math.PI * 2, 0, Math.PI / 2);
     geom.scale(1, DOME_H / DOME_R, 1);
     this.domeUniforms = { uOpacity: { value: 1 } };
     const dome = new THREE.Mesh(
@@ -360,6 +403,7 @@ export class World {
         transparent: true,
         depthWrite: false,
         side: THREE.DoubleSide,
+        forceSinglePass: true,
         vertexShader: `
           varying vec3 vN; varying vec3 vV; varying float vH;
           void main(){
@@ -411,7 +455,7 @@ export class World {
       named.set(name, v);
       pts.push({ v, size: Math.max(2.2, 7.5 - mag * 1.6), tw: rand() });
     }
-    const extra = this.highQuality ? 420 : 260;
+    const extra = this.highQuality ? 420 : this.lite ? 120 : 260;
     for (let i = 0; i < extra; i++) {
       const ra = rand() * 360;
       const dec = 90 - Math.acos(1 - rand() * 1.9) * (180 / Math.PI);
@@ -470,7 +514,10 @@ export class World {
 
   buildSunMoon() {
     const sun = new THREE.Group();
-    sun.add(new THREE.Mesh(new THREE.SphereGeometry(0.42, 32, 16), new THREE.MeshBasicMaterial({ color: new THREE.Color(5, 3.6, 1.3), toneMapped: false })));
+    sun.add(new THREE.Mesh(new THREE.SphereGeometry(0.42, 32, 16), new THREE.MeshBasicMaterial({ color: '#fff6d0', toneMapped: false })));
+    const halo = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexture('rgba(255,210,120,0.45)', 'rgba(255,140,30,0.12)'), blending: THREE.AdditiveBlending, depthWrite: false, transparent: true }));
+    halo.scale.setScalar(8);
+    sun.add(halo);
     const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexture('rgba(255,236,170,1)', 'rgba(255,150,40,0.45)'), blending: THREE.AdditiveBlending, depthWrite: false, transparent: true }));
     glow.scale.setScalar(3.6);
     sun.add(glow);
@@ -537,43 +584,43 @@ export class World {
     this.world.add(moon);
   }
 
-  setupComposer() {
-    this.composer = null;
-    if (!this.highQuality) return;
-    const composer = new EffectComposer(this.renderer);
-    composer.addPass(new RenderPass(this.scene, this.camera));
-    this.bloom = new UnrealBloomPass(new THREE.Vector2(256, 256), 0.55, 0.4, 1.0);
-    composer.addPass(this.bloom);
-    composer.addPass(new OutputPass());
-    this.composer = composer;
-  }
-
   // ---------- public API ----------
+
+  // Ask for a redraw on the next display refresh (used whenever something changes while idle).
+  invalidate() {
+    this.dirty = true;
+  }
 
   setMapCanvas(canvas) {
     swapImage(this.mapTexture, canvas);
+    this.dirty = true;
   }
 
   setOverlayCanvas(canvas) {
     swapImage(this.overlayTexture, canvas);
+    this.dirty = true;
   }
 
   refreshOverlay() {
     this.overlayTexture.needsUpdate = true;
+    this.dirty = true;
   }
 
   // Dome stars dim while a lesson card is in play so they never clutter the map.
   setStarAlpha(a) {
     this.starUniforms.uAlpha.value = a;
     this.starLines.material.opacity = 0.32 * a;
+    this.dirty = true;
   }
 
   setDomeAlpha(a) {
     this.domeUniforms.uOpacity.value = a;
+    this.dirty = true;
   }
 
   setDayNight(on) {
     this.discUniforms.uDayNight.value = on ? 1 : 0;
+    this.dirty = true;
   }
 
   setSky(sky) {
@@ -617,6 +664,7 @@ export class World {
     this.camera.position.copy(p.pos);
     this.controls.target.copy(p.target);
     this.controls.update();
+    this.dirty = true;
   }
 
   flyTo(name, duration = 1.4) {
@@ -712,6 +760,7 @@ export class World {
     }
     this.pins = [];
     this.pulses = [];
+    this.dirty = true;
   }
 
   // ---------- loop ----------
@@ -721,21 +770,54 @@ export class World {
     const h = Math.max(1, this.container.clientHeight);
     this.width = w;
     this.height = h;
-    const dpr = Math.min(window.devicePixelRatio || 1, this.highQuality ? 2 : 1.25);
-    this.renderer.setPixelRatio(dpr);
+    this.renderer.setPixelRatio(this.dpr);
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
-    this.starUniforms.uPx.value = dpr * (h / 700);
-    if (this.composer) {
-      this.composer.setPixelRatio(dpr);
-      this.composer.setSize(w, h);
-    }
+    this.starUniforms.uPx.value = this.dpr * (h / 700);
+    this.dirty = true;
+  }
+
+  // Dynamic resolution: if frames arrive late, render fewer pixels; recover slowly when there's headroom.
+  adaptResolution(interval, cap) {
+    if (interval > 250) return; // tab switch or breakpoint, not a slow frame
+    const p = this.perf;
+    p.sum += interval;
+    p.n++;
+    if (p.n < 40) return;
+    const avg = p.sum / p.n;
+    const target = 1000 / cap;
+    p.sum = 0;
+    p.n = 0;
+    if (avg > target * 1.45 && this.dpr > 0.5) {
+      this.dpr = Math.max(0.5, Math.round((this.dpr - 0.25) * 4) / 4);
+      p.good = 0;
+      this.resize();
+    } else if (avg < target * 1.12 && this.dpr < this.dprMax) {
+      if (++p.good >= 4) {
+        this.dpr = Math.min(this.dprMax, this.dpr + 0.25);
+        p.good = 0;
+        this.resize();
+      }
+    } else p.good = 0;
   }
 
   tick() {
     const now = performance.now();
-    const dt = Math.min(0.05, (now - this.last) / 1000);
+    const spin = (this.lite ? 0 : this.autoSpin) + this.spinInput;
+    const steering = this.controlsActive || now - this.lastChange < 120 || !!this.tween || this.spinInput !== 0;
+    const interacting = now - this.lastInput < (this.lite ? 400 : 3000);
+    let cap;
+    if (steering || interacting) cap = this.fpsCap;
+    else if (spin || this.pins.length || this.pulses.length) cap = this.lite ? 15 : 30;
+    else cap = this.lite ? 1 : 20; // ambient: twinkling stars, chasing lights, moving sky
+    const elapsed = now - this.lastRender;
+    if (!this.dirty && elapsed < 1000 / cap - 2) return; // nothing new to show yet
+    if (this.lastRender && cap === this.fpsCap) this.adaptResolution(elapsed, cap);
+    this.lastRender = now;
+    this.dirty = false;
+    const realDt = Math.min(1, (now - this.last) / 1000); // true elapsed time, for clocks and timers
+    const dt = Math.min(0.1, realDt);
     this.last = now;
     const t = now / 1000;
 
@@ -750,7 +832,7 @@ export class World {
         tw.resolve();
       }
     }
-    this.world.rotation.y += (this.autoSpin + this.spinInput) * dt;
+    this.world.rotation.y += spin * dt;
     this.controls.update();
 
     this.discUniforms.uTime.value = t;
@@ -759,12 +841,15 @@ export class World {
     const s = 3.4 + Math.sin(t * 2.1) * 0.12;
     this.sunGlow.scale.set(s, s, 1);
 
-    const c = new THREE.Color();
+    const c = this.tmpColor || (this.tmpColor = new THREE.Color());
+    const glow = this.bulbGlow.geometry.attributes.color;
     for (let i = 0; i < this.bulbs.count; i++) {
       const k = 0.55 + 0.45 * Math.sin(t * 3.2 - i * 0.7);
-      this.bulbs.setColorAt(i, c.setRGB(3 * k + 0.4, 2.2 * k + 0.3, 0.8 * k + 0.1));
+      this.bulbs.setColorAt(i, c.setRGB(0.75 + 0.25 * k, 0.6 + 0.3 * k, 0.25 + 0.2 * k));
+      glow.setXYZ(i, k, k, k);
     }
     this.bulbs.instanceColor.needsUpdate = true;
+    glow.needsUpdate = true;
 
     for (const p of this.pins) {
       const age = (now - p.userData.born) / 1000;
@@ -776,9 +861,8 @@ export class World {
       r.material.opacity = Math.max(0, 1 - age / 1.4);
     }
 
-    for (const fn of this.hooks) fn(dt, t);
+    for (const fn of this.hooks) fn(realDt, t);
 
-    if (this.composer) this.composer.render(dt);
-    else this.renderer.render(this.scene, this.camera);
+    this.renderer.render(this.scene, this.camera);
   }
 }
